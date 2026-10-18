@@ -1,0 +1,19 @@
+{
+  "name": "music_sync",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Play music in perfect sync across many devices in the same room.",
+  "workspaces": ["server", "client"],
+  "scripts": {
+    "dev": "concurrently -n server,client -c blue,green \"npm:dev -w server\" \"npm:dev -w client\"",
+    "build": "npm run build -w client",
+    "start": "npm run build && NODE_ENV=production npm start -w server",
+    "test": "npm test -w server"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
