@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, rmSync, existsSync } from "node:fs";
+import { mkdirSync, rmSync, existsSync, unlink } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import express from "express";
@@ -14,6 +14,12 @@ const UPLOAD_DIR = path.resolve(process.env.UPLOAD_DIR || path.join(__dirname, "
 const CLIENT_DIST = path.resolve(__dirname, "..", "..", "client", "dist");
 const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB) || 60;
 const MAX_TRACKS_PER_ROOM = 200;
+// Limits that keep a public deployment from being filled up or spammed.
+const MAX_ROOM_MB = Number(process.env.MAX_ROOM_MB) || 400;
+const MAX_TOTAL_MB = Number(process.env.MAX_TOTAL_MB) || 2000;
+const MAX_ROOMS = Number(process.env.MAX_ROOMS) || 200;
+const MAX_CLIENTS_PER_ROOM = Number(process.env.MAX_CLIENTS_PER_ROOM) || 50;
+const MB = 1024 * 1024;
 const EMPTY_ROOM_TTL_MS = 10 * 60 * 1000;
 const ROOM_ID_RE = /^\d{6}$/;
 const AUDIO_EXT = new Set([".mp3", ".wav", ".ogg", ".oga", ".m4a", ".aac", ".flac", ".opus", ".webm"]);
@@ -24,17 +30,34 @@ mkdirSync(UPLOAD_DIR, { recursive: true });
 const rooms = new Map();
 const getRoom = (id, create = false) => {
   let room = rooms.get(id);
-  if (!room && create) {
+  if (!room && create && rooms.size < MAX_ROOMS) {
     room = new Room(id);
     rooms.set(id, room);
   }
   return room;
 };
 
+const roomBytes = (room) => room.tracks.reduce((n, t) => n + (t.size || 0), 0);
+const totalBytes = () => [...rooms.values()].reduce((n, r) => n + roomBytes(r), 0);
+
+/** Tiny fixed-window rate limiter keyed by IP. Good enough for one server instance. */
+function rateLimit(name, max, windowMs) {
+  const hits = new Map();
+  setInterval(() => hits.clear(), windowMs).unref();
+  return (req, res, next) => {
+    const key = `${name}:${req.ip}`;
+    const n = (hits.get(key) || 0) + 1;
+    hits.set(key, n);
+    if (n > max) return res.status(429).json({ error: "Too many requests, slow down a bit." });
+    next();
+  };
+}
+
 // ---------------------------------------------------------------- HTTP ----
 
 const app = express();
 app.disable("x-powered-by");
+app.set("trust proxy", 1); // real client IPs behind Render/Railway/nginx
 
 app.get("/api/health", (_req, res) => res.json({ ok: true, serverTime: serverNow() }));
 
@@ -47,7 +70,8 @@ app.get("/api/rooms", (_req, res) => {
 });
 
 /** Pick a 6-digit code nobody is using. */
-app.post("/api/rooms", (_req, res) => {
+app.post("/api/rooms", rateLimit("create", 30, 10 * 60 * 1000), (_req, res) => {
+  if (rooms.size >= MAX_ROOMS) return res.status(503).json({ error: "Server is full, try again later." });
   for (let i = 0; i < 50; i++) {
     const id = String(Math.floor(Math.random() * 1_000_000)).padStart(6, "0");
     if (!rooms.has(id)) return res.json({ id });
@@ -71,13 +95,18 @@ const upload = multer({
   },
 });
 
-app.post("/api/rooms/:roomId/tracks", (req, res, next) => {
+app.post("/api/rooms/:roomId/tracks", rateLimit("upload", 60, 10 * 60 * 1000), (req, res) => {
   const room = ROOM_ID_RE.test(req.params.roomId) && getRoom(req.params.roomId);
   if (!room) return res.status(404).json({ error: "Room not found" });
   const clientId = String(req.header("x-client-id") || "");
   if (!room.clients.has(clientId)) return res.status(403).json({ error: "Join the room first" });
   if (!room.canControl(clientId)) return res.status(403).json({ error: "Only admins can add tracks" });
   if (room.tracks.length >= MAX_TRACKS_PER_ROOM) return res.status(400).json({ error: "Track limit reached" });
+  const incoming = Number(req.header("content-length")) || 0;
+  if (roomBytes(room) + incoming > MAX_ROOM_MB * MB)
+    return res.status(413).json({ error: `This room can hold up to ${MAX_ROOM_MB} MB of music. Delete some tracks first.` });
+  if (totalBytes() + incoming > MAX_TOTAL_MB * MB)
+    return res.status(507).json({ error: "The server is out of space right now. Try again later." });
 
   upload.array("files")(req, res, (err) => {
     if (err) return res.status(400).json({ error: err.message });
@@ -144,6 +173,14 @@ wss.on("connection", (ws, req) => {
   }
 
   const room = getRoom(roomId, true);
+  if (!room) {
+    send(ws, { type: "ERROR", error: "The server is full right now. Try again later." });
+    return ws.close(1013, "full");
+  }
+  if (!room.clients.has(clientId) && room.clients.size >= MAX_CLIENTS_PER_ROOM) {
+    send(ws, { type: "ERROR", error: `This room is full (${MAX_CLIENTS_PER_ROOM} devices max).` });
+    return ws.close(1013, "room full");
+  }
   // A reconnect from the same browser replaces the old socket.
   const previous = room.clients.get(clientId);
   if (previous?.ws && previous.ws !== ws) previous.ws.close(4000, "replaced");
@@ -157,7 +194,15 @@ wss.on("connection", (ws, req) => {
 
   ws.on("pong", () => (ws.isAlive = true));
 
+  // Token bucket: allows bursts (clock sync sends ~20/s at start) but stops floods.
+  let tokens = 60;
+  let lastRefill = Date.now();
   ws.on("message", (raw) => {
+    const t = Date.now();
+    tokens = Math.min(60, tokens + ((t - lastRefill) / 1000) * 30);
+    lastRefill = t;
+    if (tokens < 1) return;
+    tokens -= 1;
     let msg;
     try {
       msg = JSON.parse(raw.toString());
@@ -206,8 +251,11 @@ function handleMessage(room, clientId, msg, ws) {
       return broadcastAction(room, room.handleTrackEnded(msg.trackId));
     case "DELETE_TRACK": {
       if (!control()) return deny();
+      const track = room.tracks.find((t) => t.id === msg.trackId);
       const { removed, action } = room.removeTrack(msg.trackId);
       if (!removed) return;
+      // Free the disk space too, not just the playlist slot.
+      if (track) unlink(path.join(UPLOAD_DIR, room.id, path.basename(track.url)), () => {});
       if (action) broadcast(room, { type: "SCHEDULED_ACTION", action });
       return broadcastState(room);
     }

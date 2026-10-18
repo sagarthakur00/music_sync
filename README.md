@@ -81,12 +81,43 @@ client/            React + TypeScript + Vite
 | `SERVER_URL`      | vite   | `http://localhost:8080` | dev proxy target                          |
 | `VITE_SERVER_URL` | client | same origin         | set when the API runs on a different domain   |
 
-## Deploying later
+## Deploy (Render, free)
 
-Deploy it as one Node service with `npm start`, on Render, Railway, Fly.io or a VPS. The host needs to
-support WebSockets and persistent disk, or point `UPLOAD_DIR` at a mounted volume. Browsers only allow
-audio and microphone-free Web Audio features properly over **HTTPS**, so put it behind TLS. If you
-host the frontend separately (for example on Vercel), build it with `VITE_SERVER_URL=https://your-api`.
+`render.yaml` is ready. Render builds the client and runs one Node service that serves everything on a
+single HTTPS URL (WebSockets included).
 
-Uploads are kept in memory and on local disk only, with no database. Rooms reset when the server
-restarts.
+1. Push this folder to a GitHub repo (see below).
+2. On https://render.com, sign in with GitHub, then **New + → Blueprint**, pick the repo and click
+   **Apply**.
+3. Wait for the build (~2–3 min). Your link looks like `https://music-sync-xxxx.onrender.com`.
+   Share it with friends.
+
+```bash
+cd ~/Desktop/music_sync
+git init && git add . && git commit -m "music_sync"
+git branch -M main
+git remote add origin https://github.com/<your-username>/music_sync.git
+git push -u origin main
+```
+
+Free plan notes:
+
+- The service sleeps after 15 minutes with no visitors. The first visit after that takes about a
+  minute to wake up.
+- Disk is temporary: uploaded songs and rooms disappear on restart or redeploy.
+- Every push to `main` redeploys automatically.
+
+Built-in limits for a public link (change them with env vars in the Render dashboard):
+
+| Variable               | Default | Meaning                               |
+| ---------------------- | ------- | ------------------------------------- |
+| `MAX_UPLOAD_MB`        | 40      | max size of one file                  |
+| `MAX_ROOM_MB`          | 300     | total music per room                  |
+| `MAX_TOTAL_MB`         | 1000    | total music on the server             |
+| `MAX_ROOMS`            | 200     | rooms at the same time                |
+| `MAX_CLIENTS_PER_ROOM` | 50      | devices per room                      |
+
+Room creation and uploads are also rate-limited per IP, and WebSocket floods are dropped.
+
+Other hosts work too (Railway, Fly.io, a VPS): build with `npm ci --include=dev && npm run build`
+and start with `npm run start -w server`. The host must support WebSockets.

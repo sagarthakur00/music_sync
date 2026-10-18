@@ -1,0 +1,20 @@
+# Render Blueprint: https://render.com/docs/blueprint-spec
+# One web service serves the React app, the API, uploads and the WebSocket on a single URL.
+services:
+  - type: web
+    name: music-sync
+    runtime: node
+    plan: free
+    buildCommand: npm ci --include=dev && npm run build
+    startCommand: npm run start -w server
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: MAX_UPLOAD_MB
+        value: "40"
+      - key: MAX_ROOM_MB
+        value: "300"
+      - key: MAX_TOTAL_MB
+        value: "1000"
